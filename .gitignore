@@ -1,0 +1,8 @@
+dataset/
+artifacts/
+output/
+__pycache__/
+*.pyc
+*.joblib
+.venv/
+venv/
