@@ -44,20 +44,37 @@ def main(data_dir, artifacts_dir, out_dir):
         columns=["source1_entity_id", "candidate_entity_id", "prob"]
     )
 
+    # Build lookup dicts ONCE via groupby, instead of filtering the whole
+    # dataframe per entity in a loop -- that pattern is what caused the
+    # earlier hang in make_pair_frame, and it would hit here too at scale.
+    cand_lookup = (
+        full.groupby("source1_entity_id")["candidate_entity_id"]
+        .apply(set)
+        .to_dict()
+        if not full.empty else {}
+    )
+
+    above = full[full["prob"] >= threshold]
+    match_lookup = (
+        above.groupby("source1_entity_id")["candidate_entity_id"]
+        .apply(set)
+        .to_dict()
+        if not above.empty else {}
+    )
+
     # candidate_pairs.tsv -- every candidate we considered, one row per S1 entity
-    cand_rows = []
-    for eid in s1["entity_id"]:
-        ids = full.loc[full["source1_entity_id"] == eid, "candidate_entity_id"]
-        cand_rows.append({"source1_entity_id": eid, "candidate_entity_ids": join_id_list(set(ids))})
+    cand_rows = [
+        {"source1_entity_id": eid, "candidate_entity_ids": join_id_list(cand_lookup.get(eid, set()))}
+        for eid in s1["entity_id"]
+    ]
     write_tsv(pd.DataFrame(cand_rows), os.path.join(out_dir, "candidate_pairs.tsv"))
 
     # matching_results.tsv -- only what cleared the threshold, but every S1
     # entity still needs a row (empty string if nothing cleared)
-    match_rows = []
-    above = full[full["prob"] >= threshold]
-    for eid in s1["entity_id"]:
-        ids = above.loc[above["source1_entity_id"] == eid, "candidate_entity_id"]
-        match_rows.append({"source1_entity_id": eid, "matched_entity_ids": join_id_list(set(ids))})
+    match_rows = [
+        {"source1_entity_id": eid, "matched_entity_ids": join_id_list(match_lookup.get(eid, set()))}
+        for eid in s1["entity_id"]
+    ]
     write_tsv(pd.DataFrame(match_rows), os.path.join(out_dir, "matching_results.tsv"))
 
     print(f"Wrote {len(match_rows)} rows to matching_results.tsv and candidate_pairs.tsv in {out_dir}")

@@ -2,22 +2,20 @@
 Features for (S1 record, candidate record) pairs -- name similarity,
 address similarity, plus a few structural ones like country match and
 digit overlap for street numbers/PINs.
-
-Using difflib for the ratio since we didn't want to depend on
-rapidfuzz/python-Levenshtein being pre-installed. If we add rapidfuzz to
-requirements.txt later, fuzz.ratio() would probably beat this a bit.
 """
-from difflib import SequenceMatcher
-
 import pandas as pd
+from rapidfuzz import fuzz
+from tqdm import tqdm
 
 from normalize import normalize_name, normalize_address, token_set, digit_tokens
+
+tqdm.pandas()
 
 
 def _ratio(a: str, b: str) -> float:
     if not a and not b:
         return 1.0
-    return SequenceMatcher(None, a, b).ratio()
+    return fuzz.ratio(a, b) / 100.0
 
 
 def _jaccard(a: frozenset, b: frozenset) -> float:
@@ -31,9 +29,6 @@ def _jaccard(a: frozenset, b: frozenset) -> float:
 
 
 def pair_features(row) -> dict:
-    """row needs name_a/name_b, addr_a/addr_b (normalized), country_a/b,
-    and the raw address strings (raw_addr_a/b) since we pull digits before
-    normalization strips the punctuation around them."""
     name_a, name_b = row.name_a, row.name_b
     addr_a, addr_b = row.addr_a, row.addr_b
 
@@ -62,40 +57,80 @@ def pair_features(row) -> dict:
 
 
 def build_feature_matrix(pairs_df: pd.DataFrame) -> pd.DataFrame:
-    """Runs pair_features row by row, returns the numeric feature matrix
-    lined up with pairs_df's row order."""
-    feats = pairs_df.apply(pair_features, axis=1, result_type="expand")
+    if pairs_df.empty:
+        return pd.DataFrame()
+    feats = pairs_df.progress_apply(pair_features, axis=1, result_type="expand")
     return feats
 
 
-def make_pair_frame(s1_df: pd.DataFrame, other_df: pd.DataFrame, candidates: dict) -> pd.DataFrame:
-    """Turns the {s1_id: {candidate_ids}} dict from blocking into one row
-    per (s1_id, candidate_id) pair, with both normalized and raw text
-    pulled in so build_feature_matrix can run on it directly."""
-    s1_idx = s1_df.set_index("entity_id")
-    other_idx = other_df.set_index("entity_id")
+def make_pair_frame(s1_df: pd.DataFrame, other_df: pd.DataFrame, candidates: dict, chunk_size: int = 20000) -> pd.DataFrame:
+    """Builds (S1, candidate) pairs in chunks and concatenates small
+    DataFrames, instead of growing one giant list of tens of millions of
+    dicts in memory before converting -- that approach exhausted RAM and
+    crashed VS Code (OOM) at real dataset scale."""
+    if not candidates:
+        return pd.DataFrame()
 
-    rows = []
-    for s1_id, cand_ids in candidates.items():
-        if s1_id not in s1_idx.index or not cand_ids:
-            continue
-        s1_row = s1_idx.loc[s1_id]
-        for cid in cand_ids:
-            if cid not in other_idx.index:
+    s1_ids_needed = set(candidates.keys())
+    other_ids_needed = set()
+    for cand_ids in candidates.values():
+        other_ids_needed |= cand_ids
+
+    s1_records = (
+        s1_df[s1_df["entity_id"].isin(s1_ids_needed)]
+        .set_index("entity_id")
+        .to_dict("index")
+    )
+    other_records = (
+        other_df[other_df["entity_id"].isin(other_ids_needed)]
+        .set_index("entity_id")
+        .to_dict("index")
+    )
+
+    # Normalize each unique record once, not once per pair.
+    s1_norm = {
+        eid: (normalize_name(r["business_name"]), normalize_address(r["business_address"]))
+        for eid, r in s1_records.items()
+    }
+    other_norm = {
+        eid: (normalize_name(r["business_name"]), normalize_address(r["business_address"]))
+        for eid, r in other_records.items()
+    }
+
+    s1_ids = list(candidates.keys())
+    chunk_frames = []
+
+    for start in tqdm(range(0, len(s1_ids), chunk_size), desc="building pairs (chunked)"):
+        chunk_ids = s1_ids[start:start + chunk_size]
+        rows = []
+        for s1_id in chunk_ids:
+            cand_ids = candidates[s1_id]
+            if s1_id not in s1_records or not cand_ids:
                 continue
-            o_row = other_idx.loc[cid]
-            rows.append(
-                {
-                    "source1_entity_id": s1_id,
-                    "candidate_entity_id": cid,
-                    "name_a": normalize_name(s1_row["business_name"]),
-                    "name_b": normalize_name(o_row["business_name"]),
-                    "addr_a": normalize_address(s1_row["business_address"]),
-                    "addr_b": normalize_address(o_row["business_address"]),
-                    "raw_addr_a": s1_row["business_address"],
-                    "raw_addr_b": o_row["business_address"],
-                    "country_a": s1_row["country"],
-                    "country_b": o_row["country"],
-                }
-            )
-    return pd.DataFrame(rows)
+            s1_row = s1_records[s1_id]
+            name_a, addr_a = s1_norm[s1_id]
+            for cid in cand_ids:
+                if cid not in other_records:
+                    continue
+                o_row = other_records[cid]
+                name_b, addr_b = other_norm[cid]
+                rows.append(
+                    {
+                        "source1_entity_id": s1_id,
+                        "candidate_entity_id": cid,
+                        "name_a": name_a,
+                        "name_b": name_b,
+                        "addr_a": addr_a,
+                        "addr_b": addr_b,
+                        "raw_addr_a": s1_row["business_address"],
+                        "raw_addr_b": o_row["business_address"],
+                        "country_a": s1_row["country"],
+                        "country_b": o_row["country"],
+                    }
+                )
+        if rows:
+            chunk_frames.append(pd.DataFrame(rows))
+
+    if not chunk_frames:
+        return pd.DataFrame()
+    return pd.concat(chunk_frames, ignore_index=True)

@@ -21,6 +21,7 @@ import random
 import joblib
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 from utils import read_tsv, load_ground_truth, macro_f_beta, parse_id_list
@@ -42,19 +43,40 @@ def entity_split(s1_ids, val_frac=0.2, seed=42):
     return set(ids[n_val:]), set(ids[:n_val])  # train_ids, val_ids
 
 
-def build_labeled_pairs(s1_df, other_df, candidates, ground_truth):
-    """candidates from blocking, ground_truth filtered to this source's ids
-    already (caller does that). Labels each pair 1/0 depending on whether
-    it's actually in ground truth, returns X, y, and the pair frame (need
-    the frame later to group predictions back by S1 entity)."""
-    pair_frame = make_pair_frame(s1_df, other_df, candidates)
-    if pair_frame.empty:
-        return pd.DataFrame(), pd.Series(dtype=int), pair_frame
-    X = build_feature_matrix(pair_frame)
-    y = pair_frame.apply(
-        lambda r: int(r["candidate_entity_id"] in ground_truth.get(r["source1_entity_id"], set())),
-        axis=1,
-    )
+def build_labeled_pairs(s1_df, other_df, candidates, ground_truth, batch_size=50000):
+    """Processes candidates in batches so we never hold all pairs' text
+    data plus feature matrix in memory at once -- that combination was
+    causing OOM crashes at full dataset scale. Each batch produces only
+    the small numeric feature matrix + labels, which we accumulate; the
+    heavy text columns are dropped after each batch is done with them."""
+    s1_ids = list(candidates.keys())
+    X_parts, y_parts, id_parts = [], [], []
+
+    for i in tqdm(range(0, len(s1_ids), batch_size), desc="labeling pairs (batched)"):
+        batch_ids = s1_ids[i:i + batch_size]
+        batch_candidates = {eid: candidates[eid] for eid in batch_ids}
+
+        pf = make_pair_frame(s1_df, other_df, batch_candidates)
+        if pf.empty:
+            continue
+        Xb = build_feature_matrix(pf)
+        yb = pd.Series(
+            [
+                int(cid in ground_truth.get(eid, set()))
+                for eid, cid in zip(pf["source1_entity_id"], pf["candidate_entity_id"])
+            ],
+            index=pf.index,
+        )
+        X_parts.append(Xb)
+        y_parts.append(yb)
+        id_parts.append(pf[["source1_entity_id", "candidate_entity_id"]])
+
+    if not X_parts:
+        return pd.DataFrame(), pd.Series(dtype=int), pd.DataFrame()
+
+    X = pd.concat(X_parts, ignore_index=True)
+    y = pd.concat(y_parts, ignore_index=True)
+    pair_frame = pd.concat(id_parts, ignore_index=True)
     return X, y, pair_frame
 
 
@@ -76,12 +98,36 @@ def predict_proba(clf, X):
     return clf.predict_proba(X)[:, 1]
 
 
+def build_val_predictions(clf, s1_val, other_df, batch_size=50000):
+    """Same batched approach as build_labeled_pairs, but for scoring the
+    val split with the trained classifier (no labels needed here)."""
+    cand_val = generate_candidates(s1_val, other_df)
+    s1_ids = list(cand_val.keys())
+    pf_parts, prob_parts = [], []
+
+    for i in tqdm(range(0, len(s1_ids), batch_size), desc="val predict (batched)"):
+        batch_ids = s1_ids[i:i + batch_size]
+        batch_candidates = {eid: cand_val[eid] for eid in batch_ids}
+
+        pf = make_pair_frame(s1_val, other_df, batch_candidates)
+        if pf.empty:
+            continue
+        Xv = build_feature_matrix(pf)
+        probs = predict_proba(clf, Xv)
+        pf_parts.append(pf[["source1_entity_id", "candidate_entity_id"]])
+        prob_parts.append(probs)
+
+    if not pf_parts:
+        return pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id"]), np.array([])
+
+    pair_frame = pd.concat(pf_parts, ignore_index=True)
+    probs_all = np.concatenate(prob_parts)
+    return pair_frame, probs_all
+
+
 def tune_threshold(val_pair_frame, val_probs, ground_truth_full):
     """Sweeps thresholds, builds the predicted match set per S1 entity at
-    each one, scores with macro F_0.5, keeps whichever threshold wins.
-    ground_truth_full needs to cover every val entity, singletons included --
-    an entity with nothing above threshold still needs to be scored (1.0 if
-    it's a true singleton, 0.0 otherwise)."""
+    each one, scores with macro F_0.5, keeps whichever threshold wins."""
     val_pair_frame = val_pair_frame.copy()
     val_pair_frame["prob"] = val_probs
 
@@ -125,10 +171,6 @@ def main(data_dir, out_dir):
             f"[{tag}] blocking recall: {recall:.4f}  |  "
             f"candidates/entity avg={stats['avg']:.1f} median={stats['median']:.0f} max={stats['max']}"
         )
-        # recall close to 1.0 = good coverage. Candidates/entity is now
-        # scored too (smaller = ranked higher) -- if recall is safely high,
-        # try raising MIN_SIMILARITY (in blocking.py) or lowering the TOP_K
-        # constants to shrink the candidate set without losing true matches.
 
         X, y, pf = build_labeled_pairs(s1_train, other_df, cand_train, gt)
         if not X.empty:
@@ -141,16 +183,13 @@ def main(data_dir, out_dir):
 
     clf = train_classifier(X_train, y_train)
 
-    # rebuild candidates + features for the val split so we're evaluating
-    # on the same blocking behavior we'll actually see at inference time
+    # rebuild candidates + features for the val split, batched the same
+    # way, so we're evaluating on realistic inference-time behavior
     val_pair_frames, val_probs = [], []
     for other_df in (s2, s3):
-        cand_val = generate_candidates(s1_val, other_df)
-        pf_val = make_pair_frame(s1_val, other_df, cand_val)
+        pf_val, probs = build_val_predictions(clf, s1_val, other_df)
         if pf_val.empty:
             continue
-        Xv = build_feature_matrix(pf_val)
-        probs = predict_proba(clf, Xv)
         val_pair_frames.append(pf_val)
         val_probs.append(probs)
 

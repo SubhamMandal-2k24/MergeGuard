@@ -1,123 +1,166 @@
 """
-Candidate generation (blocking) for Source-1 vs Source-2/3.
+Candidate generation (blocking) -- REWRITTEN for scale.
 
-TF-IDF over character n-grams (name + address combined), top-K nearest
-neighbours by cosine similarity, per source. Same-country buckets to keep
-it fast, plus a smaller cross-country pass since country labels can be
-noisy and the test set has France, which isn't in train at all.
+The original version used TF-IDF + brute-force nearest-neighbor search,
+which is O(n x m) -- fine for a few thousand rows, completely infeasible
+once train_source1.tsv turned out to have 2.2 MILLION rows. That's exactly
+what the organizers' "blocking must scale, no full pairwise comparison"
+warning was about.
 
-Whatever doesn't show up here can never be matched later, so this step
-decides our recall ceiling -- check that against train_ground_truth before
-touching anything else (measure_blocking_recall below).
+New approach: inverted index (the standard way real-world entity
+resolution scales). Instead of comparing every record to every record:
+  1. Break each record's name+address into tokens.
+  2. Build a lookup: token -> which records contain it (per source).
+  3. Skip tokens that are too common (appear in a large fraction of
+     records) -- these create huge, useless buckets ("private", "road",
+     "and") and would blow up the same way full comparison did.
+  4. For a given S1 record, only look at records that share at least one
+     of its rare/specific tokens. This candidate pool is now small.
+  5. Score that (already small) pool with token-overlap + digit-overlap,
+     rank, keep the top ones.
 
-UPDATE (contest organizers, after start): candidate_pairs.tsv is scored
-directly now, not just used to audit recall -- a smaller candidate set per
-S1 entity ranks higher, on top of the leaderboard score. So this isn't
-just "maximize recall" anymore, it's recall vs. candidate-set size. That's
-why candidates now carry their similarity score through the whole
-pipeline instead of just being a plain set -- we keep the best-scoring
-ones and drop weak filler, instead of always keeping a fixed top-K
-regardless of how weak the match is.
+This is O(n) to build the index and O(bucket size) per lookup, not
+O(n x m). Digit tokens (street numbers, PIN codes) are especially useful
+blocking keys here -- they're rare and precise.
+
+Tradeoff vs. the old approach: token-overlap blocking is more sensitive to
+heavy typos / totally different wording than TF-IDF character n-grams was.
+That's the cost of being able to run at all on millions of rows. If real
+recall comes back too low, the first thing to try is raising
+MAX_TOKEN_BUCKET_SIZE (allow bigger buckets before dropping a token as a
+blocking key). If candidate sets are too large (they matter for ranking
+now), raise MIN_OVERLAP_SCORE instead.
 """
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
-import numpy as np
+from tqdm import tqdm
+
+from collections import defaultdict
+
 import pandas as pd
 
-from normalize import normalize_name, normalize_address
+from normalize import normalize_name, normalize_address, token_set, digit_tokens
 
-TOP_K_IN_COUNTRY = 15
-TOP_K_CROSS_COUNTRY = 5
-MAX_CANDIDATES_PER_SOURCE = 20
+# A token whose bucket (how many records contain it) exceeds this absolute
+# count is dropped as a blocking key -- it's too common to narrow anything
+# down ("private", "road", etc.) and would blow up comparison cost.
+# This is an ABSOLUTE cap, not a fraction of dataset size -- a fraction-based
+# cutoff behaves wildly differently on 30 rows vs. 2 million rows, which is
+# exactly the bug that broke recall on the small test below before this fix.
+MAX_TOKEN_BUCKET_SIZE = 800
 
-# Minimum cosine similarity to even count as a candidate. This is the main
-# lever for the recall-vs-candidate-size tradeoff -- raise it to shrink
-# candidate sets (better for the new scoring), lower it if recall drops too
-# much on real data. 0.15 is a conservative starting point, not tuned yet.
-MIN_SIMILARITY = 0.15
+# Real business records share a LOT of common words (Private, Limited, Road,
+# city names) -- far more than synthetic test data did. Unioning every
+# token's bucket for a record blew up pool sizes and made this take hours
+# on the real 2.2M-row dataset. Fix: only use each record's N *rarest*
+# tokens (smallest buckets) to build its candidate pool -- these are the
+# most distinctive (street numbers, PINs, unusual words), and this bounds
+# pool size hard regardless of how many common words the record also has.
+NUM_RARE_TOKENS_FOR_POOL = 7
 
-
-def _combined_text(df: pd.DataFrame) -> pd.Series:
-    # name + address in one string, normalized -- this is what we vectorize
-    return (
-        df["business_name"].map(normalize_name)
-        + " "
-        + df["business_address"].map(normalize_address)
-    )
-
-
-def _topk_neighbors(query_vecs, ref_vecs, k):
-    # cosine kNN, returns (indices, similarity scores)
-    k = min(k, ref_vecs.shape[0])
-    if k == 0:
-        return np.empty((query_vecs.shape[0], 0), dtype=int), np.empty(
-            (query_vecs.shape[0], 0)
-        )
-    nn = NearestNeighbors(n_neighbors=k, metric="cosine", algorithm="brute")
-    nn.fit(ref_vecs)
-    dist, idx = nn.kneighbors(query_vecs)
-    sim = 1 - dist
-    return idx, sim
+MAX_CANDIDATES_PER_SOURCE = 35
+MIN_OVERLAP_SCORE = 0.05
 
 
-def _add_scored(scored: dict, eid, other_id, score):
-    # keep the higher score if the same pair shows up in both passes
-    if other_id not in scored[eid] or score > scored[eid][other_id]:
-        scored[eid][other_id] = score
+def _record_tokens(row):
+    """All blocking-relevant tokens for one record: name tokens, address
+    tokens, and digit tokens from the raw address (street numbers, PINs --
+    high-value, low-frequency blocking keys)."""
+    name = normalize_name(row["business_name"])
+    addr = normalize_address(row["business_address"])
+    toks = token_set(name) | token_set(addr)
+    digits = digit_tokens(row["business_address"])
+    # prefix digits so they don't collide with a name/address token that
+    # happens to be the same string
+    return toks | {f"#{d}" for d in digits}
+
+
+def _build_index(df: pd.DataFrame):
+    """
+    Returns:
+      token_to_ids: {token: set(entity_id, ...)} for tokens whose bucket
+                    isn't too large to be useful
+      record_tokens: {entity_id: set(tokens)} -- every record's own tokens,
+                     used later for scoring candidates
+    """
+    doc_freq = defaultdict(int)
+    record_tokens = {}
+
+    for row in df.itertuples(index=False):
+        row_d = row._asdict()
+        toks = _record_tokens(row_d)
+        record_tokens[row_d["entity_id"]] = toks
+        for t in toks:
+            doc_freq[t] += 1
+
+    token_to_ids = defaultdict(set)
+    for eid, toks in record_tokens.items():
+        for t in toks:
+            if doc_freq[t] <= MAX_TOKEN_BUCKET_SIZE:
+                token_to_ids[t].add(eid)
+
+    return token_to_ids, record_tokens
+
+
+def _overlap_score(tokens_a: set, tokens_b: set) -> float:
+    if not tokens_a and not tokens_b:
+        return 1.0
+    if not tokens_a or not tokens_b:
+        return 0.0
+    inter = len(tokens_a & tokens_b)
+    union = len(tokens_a | tokens_b)
+    return inter / union if union else 0.0
 
 
 def generate_candidates(source1: pd.DataFrame, other: pd.DataFrame) -> dict:
     """
     Run once for (source1, source2), once for (source1, source3), then
-    union the two dicts to get the full candidate set per S1 entity.
+    union the two result dicts.
     Returns {source1_entity_id: set(other_entity_id, ...)}
 
-    Internally keeps similarity scores so trimming to the cap keeps the
-    strongest candidates, not an arbitrary slice of a set.
+    Restricts to same-country pairs by building a separate index per
+    country -- this both improves precision and keeps buckets smaller.
+    A record with a country not seen on the other side gets no candidates
+    from this pass (acceptable for now -- flag if this matters for France
+    once we see real country label behavior in the test set).
     """
-    s1_text = _combined_text(source1)
-    other_text = _combined_text(other)
+    candidates = {eid: set() for eid in source1["entity_id"]}
 
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
-    all_text = pd.concat([s1_text, other_text], ignore_index=True)
-    vectorizer.fit(all_text)
-
-    s1_vecs = vectorizer.transform(s1_text)
-    other_vecs = vectorizer.transform(other_text)
-
-    scored = {eid: {} for eid in source1["entity_id"]}
-
-    # same-country top-K -- cheap, and country is usually reliable
-    for country, s1_group in source1.groupby("country"):
-        other_mask = other["country"] == country
-        if not other_mask.any():
+    for country, other_group in other.groupby("country"):
+        s1_group = source1[source1["country"] == country]
+        if s1_group.empty:
             continue
-        other_group = other[other_mask]
-        g_idx = s1_group.index
-        q_vecs = s1_vecs[source1.index.get_indexer(g_idx)]
-        r_vecs = other_vecs[other.index.get_indexer(other_group.index)]
-        idx, sim = _topk_neighbors(q_vecs, r_vecs, TOP_K_IN_COUNTRY)
-        other_ids = other_group["entity_id"].values
-        for row_pos, eid in enumerate(s1_group["entity_id"].values):
-            for col in range(idx.shape[1]):
-                if sim[row_pos, col] >= MIN_SIMILARITY:
-                    _add_scored(scored, eid, other_ids[idx[row_pos, col]], sim[row_pos, col])
 
-    # small cross-country pass -- catches cases where country is wrong/missing,
-    # and is our only shot at France since train never saw it
-    idx, sim = _topk_neighbors(s1_vecs, other_vecs, TOP_K_CROSS_COUNTRY)
-    other_ids_all = other["entity_id"].values
-    for row_pos, eid in enumerate(source1["entity_id"].values):
-        for col in range(idx.shape[1]):
-            if sim[row_pos, col] >= MIN_SIMILARITY:
-                _add_scored(scored, eid, other_ids_all[idx[row_pos, col]], sim[row_pos, col])
+        token_to_ids, other_tokens = _build_index(other_group)
 
-    # trim to the cap by score now, not by arbitrary set order -- keep the
-    # MAX_CANDIDATES_PER_SOURCE strongest matches per entity
-    candidates = {}
-    for eid, id_scores in scored.items():
-        ranked = sorted(id_scores.items(), key=lambda kv: kv[1], reverse=True)
-        candidates[eid] = set(oid for oid, _ in ranked[:MAX_CANDIDATES_PER_SOURCE])
+        for row in tqdm(s1_group.itertuples(index=False), total=len(s1_group), desc=f"blocking {country}"):
+            row_d = row._asdict()
+            eid = row_d["entity_id"]
+            my_tokens = _record_tokens(row_d)
+
+            # only use the RAREST few tokens to build the candidate pool --
+            # using every token (including common ones near the cap) is
+            # what made this too slow on real data. Digit tokens (#123)
+            # tend to be naturally rare and are prioritized implicitly since
+            # they usually have the smallest buckets already.
+            my_tokens_in_index = [t for t in my_tokens if t in token_to_ids]
+            if not my_tokens_in_index:
+                continue
+            rarest = sorted(my_tokens_in_index, key=lambda t: len(token_to_ids[t]))[:NUM_RARE_TOKENS_FOR_POOL]
+
+            pool = set()
+            for t in rarest:
+                pool |= token_to_ids[t]
+
+            if not pool:
+                continue
+
+            scored = []
+            for oid in pool:
+                score = _overlap_score(my_tokens, other_tokens[oid])
+                if score >= MIN_OVERLAP_SCORE:
+                    scored.append((oid, score))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            candidates[eid] |= {oid for oid, _ in scored[:MAX_CANDIDATES_PER_SOURCE]}
 
     return candidates
 
@@ -137,10 +180,9 @@ def measure_blocking_recall(candidates: dict, ground_truth: dict) -> float:
 
 
 def candidate_set_stats(candidates: dict) -> dict:
-    """Avg/median/max candidates per S1 entity. Now that candidate_pairs.tsv
-    is scored directly (smaller candidate sets rank higher), check this
-    alongside recall every time blocking changes -- it's the other half of
-    the tradeoff, not just a nice-to-have number."""
+    """Avg/median/max candidates per S1 entity. candidate_pairs.tsv is
+    scored directly now (smaller candidate sets rank higher), so check this
+    alongside recall every time blocking changes."""
     sizes = [len(v) for v in candidates.values()]
     if not sizes:
         return {"avg": 0.0, "median": 0.0, "max": 0}
