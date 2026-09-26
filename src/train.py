@@ -12,6 +12,7 @@ Training pipeline:
 
 Usage (from src/):
     python train.py --data-dir ../dataset
+    python train.py --data-dir ../dataset --sample-size 200000   # fast sanity run
 """
 import argparse
 import json
@@ -144,13 +145,26 @@ def tune_threshold(val_pair_frame, val_probs, ground_truth_full):
     return best_t, best_score
 
 
-def main(data_dir, out_dir):
+def main(data_dir, out_dir, sample_size=None, sample_seed=42):
     os.makedirs(out_dir, exist_ok=True)
 
     s1 = read_tsv(os.path.join(data_dir, "train", "train_source1.tsv"))
     s2 = read_tsv(os.path.join(data_dir, "train", "train_source2.tsv"))
     s3 = read_tsv(os.path.join(data_dir, "train", "train_source3.tsv"))
     gt = load_ground_truth(os.path.join(data_dir, "train", "train_ground_truth.tsv"))
+
+    # --sample-size lets you run the WHOLE pipeline end-to-end on a subset
+    # of S1 entities (S2/S3 stay full-size, since candidates still need to
+    # be found among all of them) to get a fast, real val F_0.5 number and
+    # catch bugs/crashes before committing hours to the full 2.2M-row run.
+    # S2/S3 are left untouched on purpose -- shrinking them would distort
+    # blocking bucket sizes and candidate pool composition vs. the real run.
+    if sample_size is not None and sample_size < len(s1):
+        s1 = s1.sample(n=sample_size, random_state=sample_seed).reset_index(drop=True)
+        print(
+            f"[--sample-size] using {len(s1)} of the full S1 entities "
+            f"(seed={sample_seed}) for a fast sanity run"
+        )
 
     train_ids, val_ids = entity_split(s1["entity_id"].tolist())
     s1_train = s1[s1["entity_id"].isin(train_ids)].reset_index(drop=True)
@@ -210,5 +224,18 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default="../dataset")
     ap.add_argument("--out-dir", default="../artifacts")
+    ap.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="Subsample this many S1 entities for a fast end-to-end sanity run "
+        "(e.g. 200000). S2/S3 stay full-size. Omit for a real/full run.",
+    )
+    ap.add_argument(
+        "--sample-seed",
+        type=int,
+        default=42,
+        help="Random seed for --sample-size subsampling (default 42).",
+    )
     args = ap.parse_args()
-    main(args.data_dir, args.out_dir)
+    main(args.data_dir, args.out_dir, args.sample_size, args.sample_seed)
