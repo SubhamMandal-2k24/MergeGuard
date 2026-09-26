@@ -24,7 +24,7 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 from utils import read_tsv, load_ground_truth, macro_f_beta, parse_id_list
-from blocking import generate_candidates, measure_blocking_recall
+from blocking import generate_candidates, measure_blocking_recall, candidate_set_stats
 from features import make_pair_frame, build_feature_matrix
 
 try:
@@ -120,7 +120,15 @@ def main(data_dir, out_dir):
             if eid in train_ids
         }
         recall = measure_blocking_recall(cand_train, gt_this_source)
-        print(f"[{tag}] blocking recall on train split: {recall:.4f}")
+        stats = candidate_set_stats(cand_train)
+        print(
+            f"[{tag}] blocking recall: {recall:.4f}  |  "
+            f"candidates/entity avg={stats['avg']:.1f} median={stats['median']:.0f} max={stats['max']}"
+        )
+        # recall close to 1.0 = good coverage. Candidates/entity is now
+        # scored too (smaller = ranked higher) -- if recall is safely high,
+        # try raising MIN_SIMILARITY (in blocking.py) or lowering the TOP_K
+        # constants to shrink the candidate set without losing true matches.
 
         X, y, pf = build_labeled_pairs(s1_train, other_df, cand_train, gt)
         if not X.empty:
